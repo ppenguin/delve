@@ -142,6 +142,8 @@ func (dbp *Target) Continue() error {
 				// (linux-arm64 feature or kernel bug maybe).
 				if !arch.BreakInstrMovesPC() {
 					setPC(curthread, loc.PC+uint64(arch.BreakpointSize()))
+					// if arch.Name == "arm64" { // puppywang override: check if obsolete
+					// 	curthread.SetPC(loc.PC + uint64(arch.BreakpointSize()))
 				}
 				// Single-step current thread until we exit runtime.breakpoint and
 				// runtime.Breakpoint.
@@ -154,7 +156,7 @@ func (dbp *Target) Continue() error {
 				return conditionErrors(threads)
 			case g == nil || dbp.fncallForG[g.ID] == nil:
 				// a hardcoded breakpoint somewhere else in the code (probably cgo), or manual stop in cgo
-				if !arch.BreakInstrMovesPC() {
+				if arch.Name == "arm64" {
 					bpsize := arch.BreakpointSize()
 					bp := make([]byte, bpsize)
 					dbp.Memory().ReadMemory(bp, loc.PC)
