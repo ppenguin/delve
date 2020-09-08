@@ -156,7 +156,7 @@ func (dbp *Target) Continue() error {
 				return conditionErrors(threads)
 			case g == nil || dbp.fncallForG[g.ID] == nil:
 				// a hardcoded breakpoint somewhere else in the code (probably cgo), or manual stop in cgo
-				if arch.Name == "arm64" {
+				if !arch.BreakInstrMovesPC() {
 					bpsize := arch.BreakpointSize()
 					bp := make([]byte, bpsize)
 					dbp.Memory().ReadMemory(bp, loc.PC)
