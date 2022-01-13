@@ -104,7 +104,7 @@ func TestScope(t *testing.T) {
 			}
 
 			scopeCheck.ok = true
-			_, err := p.ClearBreakpoint(bp.Addr)
+			err := p.ClearBreakpoint(bp.Addr)
 			assertNoError(err, t, "ClearBreakpoint")
 		}
 	})
@@ -238,7 +238,7 @@ func (check *scopeCheck) Parse(descr string, t *testing.T) {
 }
 
 func (scopeCheck *scopeCheck) checkLocalsAndArgs(p *proc.Target, t *testing.T) (*proc.EvalScope, bool) {
-	scope, err := proc.GoroutineScope(p.CurrentThread())
+	scope, err := proc.GoroutineScope(p, p.CurrentThread())
 	assertNoError(err, t, "GoroutineScope()")
 
 	ok := true
@@ -285,7 +285,7 @@ func (check *scopeCheck) checkVar(v *proc.Variable, t *testing.T) {
 }
 
 func (varCheck *varCheck) checkInScope(line int, scope *proc.EvalScope, t *testing.T) {
-	v, err := scope.EvalVariable(varCheck.name, normalLoadConfig)
+	v, err := scope.EvalExpression(varCheck.name, normalLoadConfig)
 	assertNoError(err, t, fmt.Sprintf("EvalVariable(%s)", varCheck.name))
 	varCheck.check(line, v, t, "EvalExpression")
 

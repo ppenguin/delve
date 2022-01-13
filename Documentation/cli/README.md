@@ -32,7 +32,9 @@ Command | Description
 [clearall](#clearall) | Deletes multiple breakpoints.
 [condition](#condition) | Set breakpoint condition.
 [on](#on) | Executes a command when a breakpoint is hit.
+[toggle](#toggle) | Toggles on or off a breakpoint.
 [trace](#trace) | Set tracepoint.
+[watch](#watch) | Set watchpoint.
 
 
 ## Viewing program variables and memory
@@ -41,7 +43,7 @@ Command | Description
 --------|------------
 [args](#args) | Print function arguments.
 [display](#display) | Print value of an expression every time the program stops.
-[examinemem](#examinemem) | Examine memory:
+[examinemem](#examinemem) | Examine raw memory at the given address.
 [locals](#locals) | Print local variables.
 [print](#print) | Evaluate an expression.
 [regs](#regs) | Print contents of CPU registers.
@@ -80,6 +82,7 @@ Command | Description
 [clear-checkpoint](#clear-checkpoint) | Deletes checkpoint.
 [config](#config) | Changes configuration parameters.
 [disassemble](#disassemble) | Disassembler.
+[dump](#dump) | Creates a core dump from the current process state
 [edit](#edit) | Open where you are in $DELVE_EDITOR or $EDITOR
 [exit](#exit) | Exit the debugger.
 [funcs](#funcs) | Print list of functions.
@@ -101,9 +104,9 @@ If regex is specified only function arguments with a name matching it will be re
 ## break
 Sets a breakpoint.
 
-	break [name] <linespec>
+	break [name] [linespec]
 
-See [Documentation/cli/locspec.md](//github.com/go-delve/delve/tree/master/Documentation/cli/locspec.md) for the syntax of linespec.
+See [Documentation/cli/locspec.md](//github.com/go-delve/delve/tree/master/Documentation/cli/locspec.md) for the syntax of linespec. If linespec is omitted a breakpoint will be set on the current line.
 
 See also: "help on", "help cond" and "help clear"
 
@@ -111,6 +114,10 @@ Aliases: b
 
 ## breakpoints
 Print out info for active breakpoints.
+	
+	breakpoints [-a]
+
+Specifying -a prints all physical breakpoint, including internal breakpoints.
 
 Aliases: bp
 
@@ -171,8 +178,28 @@ If called with the linespec argument it will delete all the breakpoints matching
 Set breakpoint condition.
 
 	condition <breakpoint name or id> <boolean expression>.
+	condition -hitcount <breakpoint name or id> <operator> <argument>
 
-Specifies that the breakpoint or tracepoint should break only if the boolean expression is true.
+Specifies that the breakpoint, tracepoint or watchpoint should break only if the boolean expression is true.
+
+See Documentation/cli/expr.md for a description of supported expressions.
+
+With the -hitcount option a condition on the breakpoint hit count can be set, the following operators are supported
+
+	condition -hitcount bp > n
+	condition -hitcount bp >= n
+	condition -hitcount bp < n
+	condition -hitcount bp <= n
+	condition -hitcount bp == n
+	condition -hitcount bp != n
+	condition -hitcount bp % n
+	
+The '% n' form means we should stop at the breakpoint when the hitcount is a multiple of n.
+
+Examples:
+	cond 2 i == 10				breakpoint 2 will stop when variable i equals 10
+	cond name runtime.curg.goid == 5	breakpoint 'name' will stop only on goroutine 5
+
 
 Aliases: cond
 
@@ -205,6 +232,16 @@ Defines <alias> as an alias to <command> or removes an alias.
 ## continue
 Run until breakpoint or program termination.
 
+	continue [<linespec>]
+
+Optional linespec argument allows you to continue until a specific location is reached. The program will halt if a breakpoint is hit before reaching the specified location.
+
+For example:
+
+	continue main.main
+	continue encoding/json.Marshal
+
+
 Aliases: c
 
 ## deferred
@@ -230,7 +267,7 @@ Aliases: disass
 ## display
 Print value of an expression every time the program stops.
 
-	display -a <expression>
+	display -a [%format] <expression>
 	display -d <number>
 
 The '-a' option adds an expression to the list of expression printed every time the program stops. The '-d' option removes the specified expression from the list.
@@ -247,6 +284,14 @@ Move the current frame down.
 Move the current frame down by <m>. The second form runs the command on the given frame.
 
 
+## dump
+Creates a core dump from the current process state
+
+	dump <output file>
+
+The core dump is always written in ELF, even on systems (windows, macOS) where this is not customary. For environments other than linux/amd64 threads and registers are dumped in a format that only Delve can read back.
+
+
 ## edit
 Open where you are in $DELVE_EDITOR or $EDITOR
 
@@ -257,17 +302,24 @@ If locspec is omitted edit will open the current source file in the editor, othe
 Aliases: ed
 
 ## examinemem
+Examine raw memory at the given address.
+
 Examine memory:
 
-	examinemem [-fmt <format>] [-len <length>] <address>
+	examinemem [-fmt <format>] [-count|-len <count>] [-size <size>] <address>
+	examinemem [-fmt <format>] [-count|-len <count>] [-size <size>] -x <expression>
 
-Format represents the data format and the value is one of this list (default hex): bin(binary), oct(octal), dec(decimal), hex(hexadecimal),.
+Format represents the data format and the value is one of this list (default hex): bin(binary), oct(octal), dec(decimal), hex(hexadecimal), addr(address).
 Length is the number of bytes (default 1) and must be less than or equal to 1000.
-Address is the memory location of the target to examine.
+Address is the memory location of the target to examine. Please note '-len' is deprecated by '-count and -size'.
+Expression can be an integer expression or pointer value of the memory location to examine.
 
 For example:
 
-    x -fmt hex -len 20 0xc00008af38
+    x -fmt hex -count 20 -size 1 0xc00008af38
+    x -fmt hex -count 20 -size 1 -x 0xc00008af38 + 8
+    x -fmt hex -count 20 -size 1 -x &myVar
+    x -fmt hex -count 20 -size 1 -x myPtrVar
 
 Aliases: x
 
@@ -314,18 +366,62 @@ Aliases: gr
 ## goroutines
 List program goroutines.
 
-	goroutines [-u (default: user location)|-r (runtime location)|-g (go statement location)|-s (start location)] [-t (stack trace)] [-l (labels)]
+	goroutines [-u|-r|-g|-s] [-t [depth]] [-l] [-with loc expr] [-without loc expr] [-group argument]
 
 Print out info for every goroutine. The flag controls what information is shown along with each goroutine:
 
-	-u	displays location of topmost stackframe in user code
+	-u	displays location of topmost stackframe in user code (default)
 	-r	displays location of topmost stackframe (including frames inside private runtime functions)
 	-g	displays location of go instruction that created the goroutine
 	-s	displays location of the start function
-	-t	displays goroutine's stacktrace
+	-t	displays goroutine's stacktrace (an optional depth value can be specified, default: 10)
 	-l	displays goroutine's labels
 
-If no flag is specified the default is -u.
+If no flag is specified the default is -u, i.e. the first frame within the first 30 frames that is not executing a runtime private function.
+
+FILTERING
+
+If -with or -without are specified only goroutines that match the given condition are returned.
+
+To only display goroutines where the specified location contains (or does not contain, for -without and -wo) expr as a substring, use:
+
+	goroutines -with (userloc|curloc|goloc|startloc) expr
+	goroutines -w (userloc|curloc|goloc|startloc) expr
+	goroutines -without (userloc|curloc|goloc|startloc) expr
+	goroutines -wo (userloc|curloc|goloc|startloc) expr
+	
+To only display goroutines that have (or do not have) the specified label key and value, use:
+	
+
+	goroutines -with label key=value
+	goroutines -without label key=value
+	
+To only display goroutines that have (or do not have) the specified label key, use:
+
+	goroutines -with label key
+	goroutines -without label key
+	
+To only display goroutines that are running (or are not running) on a OS thread, use:
+
+
+	goroutines -with running
+	goroutines -without running
+	
+To only display user (or runtime) goroutines, use:
+
+	goroutines -with user
+	goroutines -without user
+
+GROUPING
+
+	goroutines -group (userloc|curloc|goloc|startloc|running|user)
+
+Groups goroutines by the given location, running status or user classification, up to 5 goroutines per group will be displayed as well as the total number of goroutines in the group.
+
+	goroutines -group label key
+
+Groups goroutines by the value of the label with the specified key.
+
 
 Aliases: grs
 
@@ -371,7 +467,7 @@ If regex is specified only local variables with a name matching it will be retur
 ## next
 Step over to next source line.
 
-	 next [count]
+	next [count]
 
 Optional [count] argument allows you to skip multiple lines.
 
@@ -381,17 +477,28 @@ Aliases: n
 ## on
 Executes a command when a breakpoint is hit.
 
-	on <breakpoint name or id> <command>.
+	on <breakpoint name or id> <command>
+	on <breakpoint name or id> -edit
+	
 
-Supported commands: print, stack and goroutine)
+Supported commands: print, stack, goroutine, trace and cond. 
+To convert a breakpoint into a tracepoint use:
+	
+	on <breakpoint name or id> trace
+
+The command 'on <bp> cond <cond-arguments>' is equivalent to 'cond <bp> <cond-arguments>'.
+
+The command 'on x -edit' can be used to edit the list of commands executed when the breakpoint is hit.
 
 
 ## print
 Evaluate an expression.
 
-	[goroutine <n>] [frame <m>] print <expression>
+	[goroutine <n>] [frame <m>] print [%format] <expression>
 
-See [Documentation/cli/expr.md](//github.com/go-delve/delve/tree/master/Documentation/cli/expr.md) for a description of supported expressions.
+See Documentation/cli/expr.md for a description of supported expressions.
+
+The optional format argument is a format specifier, like the ones used by the fmt package. For example "print %x v" will print v as an hexadecimal number.
 
 Aliases: p
 
@@ -404,7 +511,7 @@ Print contents of CPU registers.
 
 	regs [-a]
 
-Argument -a shows more registers.
+Argument -a shows more registers. Individual registers can also be displayed by 'print' and 'display'. See Documentation/cli/expr.md.
 
 
 ## restart
@@ -412,7 +519,7 @@ Restart process.
 
 For recorded targets the command takes the following forms:
 
-	restart					resets ot the start of the recording
+	restart					resets to the start of the recording
 	restart [checkpoint]			resets the recording to the given checkpoint
 	restart -r [newargv...]	[redirects...]	re-records the target process
 	
@@ -447,7 +554,7 @@ Changes the value of a variable.
 
 	[goroutine <n>] [frame <m>] set <variable> = <value>
 
-See [Documentation/cli/expr.md](//github.com/go-delve/delve/tree/master/Documentation/cli/expr.md) for a description of supported expressions. Only numerical variables and pointers can be changed.
+See Documentation/cli/expr.md for a description of supported expressions. Only numerical variables and pointers can be changed.
 
 
 ## source
@@ -512,12 +619,18 @@ Aliases: tr
 Print out info for every traced thread.
 
 
+## toggle
+Toggles on or off a breakpoint.
+
+toggle <breakpoint name or id>
+
+
 ## trace
 Set tracepoint.
 
-	trace [name] <linespec>
+	trace [name] [linespec]
 
-A tracepoint is a breakpoint that does not stop the execution of the program, instead when the tracepoint is hit a notification is displayed. See [Documentation/cli/locspec.md](//github.com/go-delve/delve/tree/master/Documentation/cli/locspec.md) for the syntax of linespec.
+A tracepoint is a breakpoint that does not stop the execution of the program, instead when the tracepoint is hit a notification is displayed. See [Documentation/cli/locspec.md](//github.com/go-delve/delve/tree/master/Documentation/cli/locspec.md) for the syntax of linespec. If linespec is omitted a tracepoint will be set on the current line.
 
 See also: "help on", "help cond" and "help clear"
 
@@ -546,6 +659,26 @@ Print package variables.
 	vars [-v] [<regex>]
 
 If regex is specified only package variables with a name matching it will be returned. If -v is specified more information about each package variable will be shown.
+
+
+## watch
+Set watchpoint.
+	
+	watch [-r|-w|-rw] <expr>
+	
+	-r	stops when the memory location is read
+	-w	stops when the memory location is written
+	-rw	stops when the memory location is read or written
+
+The memory location is specified with the same expression language used by 'print', for example:
+
+	watch v
+
+will watch the address of variable 'v'.
+
+Note that writes that do not change the value of the watched memory address might not be reported.
+
+See also: "help print".
 
 
 ## whatis

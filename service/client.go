@@ -66,12 +66,18 @@ type Client interface {
 	GetBreakpointByName(name string) (*api.Breakpoint, error)
 	// CreateBreakpoint creates a new breakpoint.
 	CreateBreakpoint(*api.Breakpoint) (*api.Breakpoint, error)
+	// CreateWatchpoint creates a new watchpoint.
+	CreateWatchpoint(api.EvalScope, string, api.WatchType) (*api.Breakpoint, error)
 	// ListBreakpoints gets all breakpoints.
-	ListBreakpoints() ([]*api.Breakpoint, error)
+	ListBreakpoints(bool) ([]*api.Breakpoint, error)
 	// ClearBreakpoint deletes a breakpoint by ID.
 	ClearBreakpoint(id int) (*api.Breakpoint, error)
 	// ClearBreakpointByName deletes a breakpoint by name
 	ClearBreakpointByName(name string) (*api.Breakpoint, error)
+	// ToggleBreakpoint toggles on or off a breakpoint by ID.
+	ToggleBreakpoint(id int) (*api.Breakpoint, error)
+	// ToggleBreakpointByName toggles on or off a breakpoint by name.
+	ToggleBreakpointByName(name string) (*api.Breakpoint, error)
 	// Allows user to update an existing breakpoint for example to change the information
 	// retrieved when the breakpoint is hit or to change, add or remove the break condition
 	AmendBreakpoint(*api.Breakpoint) error
@@ -108,6 +114,8 @@ type Client interface {
 
 	// ListGoroutines lists all goroutines.
 	ListGoroutines(start, count int) ([]*api.Goroutine, int, error)
+	// ListGoroutinesWithFilter lists goroutines matching the filters
+	ListGoroutinesWithFilter(start, count int, filters []api.ListGoroutinesFilter, group *api.GoroutineGroupingOptions) ([]*api.Goroutine, []api.GoroutineGroup, int, bool, error)
 
 	// Returns stacktrace
 	Stacktrace(goroutineID int, depth int, opts api.StacktraceOptions, cfg *api.LoadConfig) ([]api.Stackframe, error)
@@ -130,7 +138,7 @@ type Client interface {
 	// * *<address> returns the location corresponding to the specified address
 	// NOTE: this function does not actually set breakpoints.
 	// If findInstruction is true FindLocation will only return locations that correspond to instructions.
-	FindLocation(scope api.EvalScope, loc string, findInstruction bool) ([]api.Location, error)
+	FindLocation(scope api.EvalScope, loc string, findInstruction bool, substitutePathRules [][2]string) ([]api.Location, error)
 
 	// Disassemble code between startPC and endPC
 	DisassembleRange(scope api.EvalScope, startPC, endPC uint64, flavour api.AssemblyFlavour) (api.AsmInstructions, error)
@@ -160,10 +168,17 @@ type Client interface {
 	// ExamineMemory returns the raw memory stored at the given address.
 	// The amount of data to be read is specified by length which must be less than or equal to 1000.
 	// This function will return an error if it reads less than `length` bytes.
-	ExamineMemory(address uintptr, length int) ([]byte, error)
+	ExamineMemory(address uint64, length int) ([]byte, bool, error)
 
 	// StopRecording stops a recording if one is in progress.
 	StopRecording() error
+
+	// CoreDumpStart starts creating a core dump to the specified file
+	CoreDumpStart(dest string) (api.DumpState, error)
+	// CoreDumpWait waits for the core dump to finish, or for the specified amount of milliseconds
+	CoreDumpWait(msec int) api.DumpState
+	// CoreDumpCancel cancels a core dump in progress
+	CoreDumpCancel() error
 
 	// Disconnect closes the connection to the server without sending a Detach request first.
 	// If cont is true a continue command will be sent instead.

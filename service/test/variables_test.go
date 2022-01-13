@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"go/constant"
+	"io/ioutil"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -85,13 +86,13 @@ func findFirstNonRuntimeFrame(p *proc.Target) (proc.Stackframe, error) {
 
 func evalScope(p *proc.Target) (*proc.EvalScope, error) {
 	if testBackend != "rr" {
-		return proc.GoroutineScope(p.CurrentThread())
+		return proc.GoroutineScope(p, p.CurrentThread())
 	}
 	frame, err := findFirstNonRuntimeFrame(p)
 	if err != nil {
 		return nil, err
 	}
-	return proc.FrameToScope(p.BinInfo(), p.CurrentThread(), nil, frame), nil
+	return proc.FrameToScope(p, p.Memory(), nil, frame), nil
 }
 
 func evalVariable(p *proc.Target, symbol string, cfg proc.LoadConfig) (*proc.Variable, error) {
@@ -100,7 +101,7 @@ func evalVariable(p *proc.Target, symbol string, cfg proc.LoadConfig) (*proc.Var
 		return nil, err
 	}
 
-	return scope.EvalVariable(symbol, cfg)
+	return scope.EvalExpression(symbol, cfg)
 }
 
 func (tc *varTest) alternateVarTest() varTest {
@@ -110,7 +111,7 @@ func (tc *varTest) alternateVarTest() varTest {
 }
 
 func setVariable(p *proc.Target, symbol, value string) error {
-	scope, err := proc.GoroutineScope(p.CurrentThread())
+	scope, err := proc.GoroutineScope(p, p.CurrentThread())
 	if err != nil {
 		return err
 	}
@@ -131,9 +132,9 @@ func withTestProcessArgs(name string, t *testing.T, wd string, args []string, bu
 	var tracedir string
 	switch testBackend {
 	case "native":
-		p, err = native.Launch(append([]string{fixture.Path}, args...), wd, false, []string{}, "", [3]string{})
+		p, err = native.Launch(append([]string{fixture.Path}, args...), wd, 0, []string{}, "", [3]string{})
 	case "lldb":
-		p, err = gdbserial.LLDBLaunch(append([]string{fixture.Path}, args...), wd, false, []string{}, "", [3]string{})
+		p, err = gdbserial.LLDBLaunch(append([]string{fixture.Path}, args...), wd, 0, []string{}, "", [3]string{})
 	case "rr":
 		protest.MustHaveRecordingAllowed(t)
 		t.Log("recording")
@@ -389,7 +390,7 @@ func TestMultilineVariableEvaluation(t *testing.T) {
 		for _, tc := range testcases {
 			variable, err := evalVariable(p, tc.name, pnormalLoadConfig)
 			assertNoError(err, t, "EvalVariable() returned an error")
-			if ms := api.ConvertVar(variable).MultilineString(""); !matchStringOrPrefix(ms, tc.value) {
+			if ms := api.ConvertVar(variable).MultilineString("", ""); !matchStringOrPrefix(ms, tc.value) {
 				t.Fatalf("Expected %s got %s (variable %s)\n", tc.value, ms, variable.Name)
 			}
 		}
@@ -442,8 +443,10 @@ func TestLocalVariables(t *testing.T) {
 				{"f32", true, "1.2", "", "float32", nil},
 				{"i32", true, "[2]int32 [1,2]", "", "[2]int32", nil},
 				{"i8", true, "1", "", "int8", nil},
+				{"mp", true, "map[int]interface {} [1: 42, 2: 43, ]", "", "map[int]interface {}", nil},
 				{"ms", true, "main.Nest {Level: 0, Nest: *main.Nest {Level: 1, Nest: *(*main.Nest)…", "", "main.Nest", nil},
 				{"neg", true, "-1", "", "int", nil},
+				{"ni", true, "[]interface {} len: 1, cap: 1, [[]interface {} len: 1, cap: 1, [*(*interface {})…", "", "[]interface {}", nil},
 				{"u16", true, "65535", "", "uint16", nil},
 				{"u32", true, "4294967295", "", "uint32", nil},
 				{"u64", true, "18446744073709551615", "", "uint64", nil},
@@ -468,10 +471,10 @@ func TestLocalVariables(t *testing.T) {
 				var frame proc.Stackframe
 				frame, err = findFirstNonRuntimeFrame(p)
 				if err == nil {
-					scope = proc.FrameToScope(p.BinInfo(), p.CurrentThread(), nil, frame)
+					scope = proc.FrameToScope(p, p.Memory(), nil, frame)
 				}
 			} else {
-				scope, err = proc.GoroutineScope(p.CurrentThread())
+				scope, err = proc.GoroutineScope(p, p.CurrentThread())
 			}
 
 			assertNoError(err, t, "scope")
@@ -502,6 +505,20 @@ func TestEmbeddedStruct(t *testing.T) {
 			{"b.C.s", true, "\"hello\"", "\"hello\"", "string", nil},
 			{"b.s", true, "\"hello\"", "\"hello\"", "string", nil},
 			{"b2", true, "main.B {A: main.A {val: 42}, C: *main.C nil, a: main.A {val: 47}, ptr: *main.A nil}", "main.B {A: (*main.A)(0x…", "main.B", nil},
+
+			// Issue 2316: field promotion is breadth first and embedded interfaces never get promoted
+			{"w2.W1.T.F", true, `"T-inside-W1"`, `"T-inside-W1"`, "string", nil},
+			{"w2.W1.F", true, `"T-inside-W1"`, `"T-inside-W1"`, "string", nil},
+			{"w2.T.F", true, `"T-inside-W2"`, `"T-inside-W2"`, "string", nil},
+			{"w2.F", true, `"T-inside-W2"`, `"T-inside-W2"`, "string", nil},
+			{"w3.I.T.F", false, `"T-inside-W1"`, `"T-inside-W1"`, "string", nil},
+			{"w3.I.F", false, `"T-inside-W1"`, `"T-inside-W1"`, "string", nil},
+			{"w3.T.F", true, `"T-inside-W3"`, `"T-inside-W3"`, "string", nil},
+			{"w3.F", true, `"T-inside-W3"`, `"T-inside-W3"`, "string", nil},
+			{"w4.I.T.F", false, `"T-inside-W1"`, `"T-inside-W1"`, "string", nil},
+			{"w4.I.F", false, `"T-inside-W1"`, `"T-inside-W1"`, "string", nil},
+			{"w4.F", false, ``, ``, "", errors.New("w4 has no member F")},
+			{"w5.F", false, ``, ``, "", errors.New("w5 has no member F")},
 		}
 		assertNoError(p.Continue(), t, "Continue()")
 
@@ -819,6 +836,10 @@ func TestEvalExpression(t *testing.T) {
 		{`iface2map.(data)`, false, "…", "…", "map[string]interface {}", nil},
 
 		{"issue1578", false, "main.Block {cache: *main.Cache nil}", "main.Block {cache: *main.Cache nil}", "main.Block", nil},
+		{"ni8 << 2", false, "-20", "-20", "int8", nil},
+		{"ni8 << 8", false, "0", "0", "int8", nil},
+		{"ni8 >> 1", false, "-3", "-3", "int8", nil},
+		{"bytearray[0] * bytearray[0]", false, "144", "144", "uint8", nil},
 	}
 
 	ver, _ := goversion.Parse(runtime.Version())
@@ -854,7 +875,6 @@ func TestEvalExpression(t *testing.T) {
 					t.Fatalf("Unexpected error. Expected %s got %s", tc.err.Error(), err.Error())
 				}
 			}
-
 		}
 	})
 }
@@ -893,7 +913,7 @@ func TestMapEvaluation(t *testing.T) {
 		m1v, err := evalVariable(p, "m1", pnormalLoadConfig)
 		assertNoError(err, t, "EvalVariable()")
 		m1 := api.ConvertVar(m1v)
-		t.Logf("m1 = %v", m1.MultilineString(""))
+		t.Logf("m1 = %v", m1.MultilineString("", ""))
 
 		if m1.Type != "map[string]main.astruct" {
 			t.Fatalf("Wrong type: %s", m1.Type)
@@ -1132,7 +1152,7 @@ func TestIssue1075(t *testing.T) {
 		setFunctionBreakpoint(p, t, "net/http.(*Client).Do")
 		assertNoError(p.Continue(), t, "Continue()")
 		for i := 0; i < 10; i++ {
-			scope, err := proc.GoroutineScope(p.CurrentThread())
+			scope, err := proc.GoroutineScope(p, p.CurrentThread())
 			assertNoError(err, t, fmt.Sprintf("GoroutineScope (%d)", i))
 			vars, err := scope.LocalVariables(pnormalLoadConfig)
 			assertNoError(err, t, fmt.Sprintf("LocalVariables (%d)", i))
@@ -1150,10 +1170,8 @@ type testCaseCallFunction struct {
 }
 
 func TestCallFunction(t *testing.T) {
-	if runtime.GOARCH == "arm64" {
-		t.Skip("arm64 does not support CallFunction for now")
-	}
 	protest.MustSupportFunctionCalls(t, testBackend)
+	protest.AllowRecording(t)
 
 	var testcases = []testCaseCallFunction{
 		// Basic function call injection tests
@@ -1266,11 +1284,15 @@ func TestCallFunction(t *testing.T) {
 		{`strings.Join(s1, comma)`, nil, errors.New(`error evaluating "s1" as argument elems in function strings.Join: could not find symbol value for s1`)},
 	}
 
-	withTestProcess("fncall", t, func(p *proc.Target, fixture protest.Fixture) {
-		_, err := proc.FindFunctionLocation(p, "runtime.debugCallV1", 0)
-		if err != nil {
-			t.Skip("function calls not supported on this version of go")
-		}
+	var testcases117 = []testCaseCallFunction{
+		{`regabistacktest("one", "two", "three", "four", "five", 4)`, []string{`:string:"onetwo"`, `:string:"twothree"`, `:string:"threefour"`, `:string:"fourfive"`, `:string:"fiveone"`, ":uint8:8"}, nil},
+		{`regabistacktest2(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)`, []string{":int:3", ":int:5", ":int:7", ":int:9", ":int:11", ":int:13", ":int:15", ":int:17", ":int:19", ":int:11"}, nil},
+		{`issue2698.String()`, []string{`:string:"1 2 3 4"`}, nil},
+	}
+
+	withTestProcessArgs("fncall", t, ".", nil, protest.AllNonOptimized, func(p *proc.Target, fixture protest.Fixture) {
+		testCallFunctionSetBreakpoint(t, p, fixture)
+
 		assertNoError(p.Continue(), t, "Continue()")
 		for _, tc := range testcases {
 			testCallFunction(t, p, tc)
@@ -1299,9 +1321,26 @@ func TestCallFunction(t *testing.T) {
 			}
 		}
 
+		if goversion.VersionAfterOrEqual(runtime.Version(), 1, 17) {
+			for _, tc := range testcases117 {
+				testCallFunction(t, p, tc)
+			}
+		}
+
 		// LEAVE THIS AS THE LAST ITEM, IT BREAKS THE TARGET PROCESS!!!
 		testCallFunction(t, p, testCaseCallFunction{"-unsafe escapeArg(&a2)", nil, nil})
 	})
+}
+
+func testCallFunctionSetBreakpoint(t *testing.T, p *proc.Target, fixture protest.Fixture) {
+	buf, err := ioutil.ReadFile(fixture.Source)
+	assertNoError(err, t, "ReadFile")
+	for i, line := range strings.Split(string(buf), "\n") {
+		if strings.Contains(line, "// breakpoint here") {
+			setFileBreakpoint(p, t, fixture, i+1)
+			return
+		}
+	}
 }
 
 func testCallFunction(t *testing.T, p *proc.Target, tc testCaseCallFunction) {
@@ -1346,7 +1385,7 @@ func testCallFunction(t *testing.T, p *proc.Target, tc testCaseCallFunction) {
 	}
 
 	if varExpr != "" {
-		scope, err := proc.GoroutineScope(p.CurrentThread())
+		scope, err := proc.GoroutineScope(p, p.CurrentThread())
 		assertNoError(err, t, "GoroutineScope")
 		v, err := scope.EvalExpression(varExpr, pnormalLoadConfig)
 		assertNoError(err, t, fmt.Sprintf("EvalExpression(%s)", varExpr))
@@ -1358,7 +1397,7 @@ func testCallFunction(t *testing.T, p *proc.Target, tc testCaseCallFunction) {
 	}
 
 	if len(retvals) != len(tc.outs) {
-		t.Fatalf("call %q: wrong number of return parameters", tc.expr)
+		t.Fatalf("call %q: wrong number of return parameters (%#v)", tc.expr, retvals)
 	}
 
 	for i := range retvals {
@@ -1521,6 +1560,8 @@ func TestPluginVariables(t *testing.T) {
 }
 
 func TestCgoEval(t *testing.T) {
+	protest.MustHaveCgo(t)
+
 	testcases := []varTest{
 		{"s", true, `"a string"`, `"a string"`, "*char", nil},
 		{"longstring", true, `"averylongstring0123456789a0123456789b0123456789c0123456789d01234...+1 more"`, `"averylongstring0123456789a0123456789b0123456789c0123456789d01234...+1 more"`, "*const char", nil},
@@ -1533,6 +1574,10 @@ func TestCgoEval(t *testing.T) {
 		{"v_align_check", true, "*align_check {a: 0, b: 0}", "(*struct align_check)(…", "*struct align_check", nil},
 		{"v_align_check[1]", false, "align_check {a: 1, b: 1}", "align_check {a: 1, b: 1}", "align_check", nil},
 		{"v_align_check[90]", false, "align_check {a: 90, b: 90}", "align_check {a: 90, b: 90}", "align_check", nil},
+	}
+
+	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
+		t.Skip("cgo doesn't work on darwin/arm64")
 	}
 
 	protest.AllowRecording(t)
@@ -1558,7 +1603,48 @@ func TestCgoEval(t *testing.T) {
 					t.Fatalf("Unexpected error. Expected %s got %s", tc.err.Error(), err.Error())
 				}
 			}
+		}
+	})
+}
 
+func TestEvalExpressionGenerics(t *testing.T) {
+	if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 18) {
+		t.Skip("generics not supported")
+	}
+
+	testcases := [][]varTest{
+		// testfn[int, float32]
+		[]varTest{
+			{"arg1", true, "3", "", "int", nil},
+			{"arg2", true, "2.1", "", "float32", nil},
+			{"m", true, "map[float32]int [2.1: 3, ]", "", "map[float32]int", nil},
+		},
+
+		// testfn[*astruct, astruct]
+		[]varTest{
+			{"arg1", true, "*main.astruct {x: 0, y: 1}", "", "*main.astruct", nil},
+			{"arg2", true, "main.astruct {x: 2, y: 3}", "", "main.astruct", nil},
+			{"m", true, "map[main.astruct]*main.astruct [{x: 2, y: 3}: *{x: 0, y: 1}, ]", "", "map[main.astruct]*main.astruct", nil},
+		},
+	}
+
+	withTestProcess("testvariables_generic", t, func(p *proc.Target, fixture protest.Fixture) {
+		for i, tcs := range testcases {
+			assertNoError(p.Continue(), t, fmt.Sprintf("Continue() returned an error (%d)", i))
+			for _, tc := range tcs {
+				variable, err := evalVariable(p, tc.name, pnormalLoadConfig)
+				if tc.err == nil {
+					assertNoError(err, t, fmt.Sprintf("EvalExpression(%s) returned an error", tc.name))
+					assertVariable(t, variable, tc)
+				} else {
+					if err == nil {
+						t.Fatalf("Expected error %s, got no error (%s)", tc.err.Error(), tc.name)
+					}
+					if tc.err.Error() != err.Error() {
+						t.Fatalf("Unexpected error. Expected %s got %s", tc.err.Error(), err.Error())
+					}
+				}
+			}
 		}
 	})
 }

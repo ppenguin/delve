@@ -22,26 +22,29 @@ type nativeProcess struct {
 	// List of threads mapped as such: pid -> *Thread
 	threads map[int]*nativeThread
 
-	// Active thread
-	currentThread *nativeThread
+	// Thread used to read and write memory
+	memthread *nativeThread
 
-	os                  *osProcessDetails
-	firstStart          bool
-	stopMu              sync.Mutex
-	resumeChan          chan<- struct{}
-	ptraceChan          chan func()
-	ptraceDoneChan      chan interface{}
-	childProcess        bool // this process was launched, not attached to
+	os             *osProcessDetails
+	firstStart     bool
+	resumeChan     chan<- struct{}
+	ptraceChan     chan func()
+	ptraceDoneChan chan interface{}
+	childProcess   bool       // this process was launched, not attached to
+	stopMu         sync.Mutex // protects manualStopRequested
+	// manualStopRequested is set if all the threads in the process were
+	// signalled to stop as a result of a Halt API call. Used to disambiguate
+	// why a thread is found to have stopped.
 	manualStopRequested bool
 
 	// Controlling terminal file descriptor for
 	// this process.
 	ctty *os.File
 
+	iscgo bool
+
 	exited, detached bool
 }
-
-var _ proc.ProcessInternal = &nativeProcess{}
 
 // newProcess returns an initialized Process struct. Before returning,
 // it will also launch a goroutine in order to handle ptrace(2)
@@ -67,39 +70,8 @@ func (dbp *nativeProcess) BinInfo() *proc.BinaryInfo {
 	return dbp.bi
 }
 
-// Recorded always returns false for the native proc backend.
-func (dbp *nativeProcess) Recorded() (bool, string) { return false, "" }
-
-// Restart will always return an error in the native proc backend, only for
-// recorded traces.
-func (dbp *nativeProcess) Restart(string) error { return proc.ErrNotRecorded }
-
-// ChangeDirection will always return an error in the native proc backend, only for
-// recorded traces.
-func (dbp *nativeProcess) ChangeDirection(dir proc.Direction) error {
-	if dir != proc.Forward {
-		return proc.ErrNotRecorded
-	}
-	return nil
-}
-
-// GetDirection will always return Forward.
-func (p *nativeProcess) GetDirection() proc.Direction { return proc.Forward }
-
-// When will always return an empty string and nil, not supported on native proc backend.
-func (dbp *nativeProcess) When() (string, error) { return "", nil }
-
-// Checkpoint will always return an error on the native proc backend,
-// only supported for recorded traces.
-func (dbp *nativeProcess) Checkpoint(string) (int, error) { return -1, proc.ErrNotRecorded }
-
-// Checkpoints will always return an error on the native proc backend,
-// only supported for recorded traces.
-func (dbp *nativeProcess) Checkpoints() ([]proc.Checkpoint, error) { return nil, proc.ErrNotRecorded }
-
-// ClearCheckpoint will always return an error on the native proc backend,
-// only supported in recorded traces.
-func (dbp *nativeProcess) ClearCheckpoint(int) error { return proc.ErrNotRecorded }
+// StartCallInjection notifies the backend that we are about to inject a function call.
+func (dbp *nativeProcess) StartCallInjection() (func(), error) { return func() {}, nil }
 
 // Detach from the process being debugged, optionally killing it.
 func (dbp *nativeProcess) Detach(kill bool) (err error) {
@@ -135,7 +107,7 @@ func (dbp *nativeProcess) Valid() (bool, error) {
 		return false, proc.ErrProcessDetached
 	}
 	if dbp.exited {
-		return false, &proc.ErrProcessExited{Pid: dbp.Pid()}
+		return false, proc.ErrProcessExited{Pid: dbp.pid}
 	}
 	return true, nil
 }
@@ -144,11 +116,6 @@ func (dbp *nativeProcess) Valid() (bool, error) {
 // ContinueOnce finishes resuming the target.
 func (dbp *nativeProcess) ResumeNotify(ch chan<- struct{}) {
 	dbp.resumeChan = ch
-}
-
-// Pid returns the process ID.
-func (dbp *nativeProcess) Pid() int {
-	return dbp.pid
 }
 
 // ThreadList returns a list of threads in the process.
@@ -166,14 +133,9 @@ func (dbp *nativeProcess) FindThread(threadID int) (proc.Thread, bool) {
 	return th, ok
 }
 
-// CurrentThread returns the current selected, active thread.
-func (dbp *nativeProcess) CurrentThread() proc.Thread {
-	return dbp.currentThread
-}
-
-// SetCurrentThread is used internally by proc.Target to change the current thread.
-func (p *nativeProcess) SetCurrentThread(th proc.Thread) {
-	p.currentThread = th.(*nativeThread)
+// Memory returns the process memory.
+func (dbp *nativeProcess) Memory() proc.MemoryReadWriter {
+	return dbp.memthread
 }
 
 // Breakpoints returns a list of breakpoints currently set.
@@ -181,11 +143,11 @@ func (dbp *nativeProcess) Breakpoints() *proc.BreakpointMap {
 	return &dbp.breakpoints
 }
 
-// RequestManualStop sets the `halt` flag and
+// RequestManualStop sets the `manualStopRequested` flag and
 // sends SIGSTOP to all threads.
 func (dbp *nativeProcess) RequestManualStop() error {
 	if dbp.exited {
-		return &proc.ErrProcessExited{Pid: dbp.Pid()}
+		return proc.ErrProcessExited{Pid: dbp.pid}
 	}
 	dbp.stopMu.Lock()
 	defer dbp.stopMu.Unlock()
@@ -205,53 +167,74 @@ func (dbp *nativeProcess) CheckAndClearManualStopRequest() bool {
 	return msr
 }
 
-func (dbp *nativeProcess) WriteBreakpoint(addr uint64) (string, int, *proc.Function, []byte, error) {
-	f, l, fn := dbp.bi.PCToLine(uint64(addr))
+func (dbp *nativeProcess) WriteBreakpoint(bp *proc.Breakpoint) error {
+	if bp.WatchType != 0 {
+		for _, thread := range dbp.threads {
+			err := thread.writeHardwareBreakpoint(bp.Addr, bp.WatchType, bp.HWBreakIndex)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 
-	originalData := make([]byte, dbp.bi.Arch.BreakpointSize())
-	_, err := dbp.currentThread.ReadMemory(originalData, uintptr(addr))
+	bp.OriginalData = make([]byte, dbp.bi.Arch.BreakpointSize())
+	_, err := dbp.memthread.ReadMemory(bp.OriginalData, bp.Addr)
 	if err != nil {
-		return "", 0, nil, nil, err
+		return err
 	}
-	if err := dbp.writeSoftwareBreakpoint(dbp.currentThread, addr); err != nil {
-		return "", 0, nil, nil, err
-	}
-
-	return f, l, fn, originalData, nil
+	return dbp.writeSoftwareBreakpoint(dbp.memthread, bp.Addr)
 }
 
 func (dbp *nativeProcess) EraseBreakpoint(bp *proc.Breakpoint) error {
-	return dbp.currentThread.ClearBreakpoint(bp)
+	if bp.WatchType != 0 {
+		for _, thread := range dbp.threads {
+			err := thread.clearHardwareBreakpoint(bp.Addr, bp.WatchType, bp.HWBreakIndex)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	return dbp.memthread.clearSoftwareBreakpoint(bp)
 }
 
 // ContinueOnce will continue the target until it stops.
 // This could be the result of a breakpoint or signal.
 func (dbp *nativeProcess) ContinueOnce() (proc.Thread, proc.StopReason, error) {
 	if dbp.exited {
-		return nil, proc.StopExited, &proc.ErrProcessExited{Pid: dbp.Pid()}
+		return nil, proc.StopExited, proc.ErrProcessExited{Pid: dbp.pid}
 	}
 
-	if err := dbp.resume(); err != nil {
-		return nil, proc.StopUnknown, err
-	}
+	for {
 
-	for _, th := range dbp.threads {
-		th.CurrentBreakpoint.Clear()
-	}
+		if err := dbp.resume(); err != nil {
+			return nil, proc.StopUnknown, err
+		}
 
-	if dbp.resumeChan != nil {
-		close(dbp.resumeChan)
-		dbp.resumeChan = nil
-	}
+		for _, th := range dbp.threads {
+			th.CurrentBreakpoint.Clear()
+		}
 
-	trapthread, err := dbp.trapWait(-1)
-	if err != nil {
-		return nil, proc.StopUnknown, err
+		if dbp.resumeChan != nil {
+			close(dbp.resumeChan)
+			dbp.resumeChan = nil
+		}
+
+		trapthread, err := dbp.trapWait(-1)
+		if err != nil {
+			return nil, proc.StopUnknown, err
+		}
+		trapthread, err = dbp.stop(trapthread)
+		if err != nil {
+			return nil, proc.StopUnknown, err
+		}
+		if trapthread != nil {
+			dbp.memthread = trapthread
+			return trapthread, proc.StopUnknown, nil
+		}
 	}
-	if err := dbp.stop(trapthread); err != nil {
-		return nil, proc.StopUnknown, err
-	}
-	return trapthread, proc.StopUnknown, err
 }
 
 // FindBreakpoint finds the breakpoint for the given pc.
@@ -282,11 +265,31 @@ func (dbp *nativeProcess) initialize(path string, debugInfoDirs []string) (*proc
 	if !dbp.childProcess {
 		stopReason = proc.StopAttached
 	}
-	return proc.NewTarget(dbp, proc.NewTargetConfig{
-		Path:                path,
-		DebugInfoDirs:       debugInfoDirs,
-		DisableAsyncPreempt: runtime.GOOS == "windows" || runtime.GOOS == "freebsd",
-		StopReason:          stopReason})
+	tgt, err := proc.NewTarget(dbp, dbp.pid, dbp.memthread, proc.NewTargetConfig{
+		Path:          path,
+		DebugInfoDirs: debugInfoDirs,
+
+		// We disable asyncpreempt for the following reasons:
+		//  - on Windows asyncpreempt is incompatible with debuggers, see:
+		//    https://github.com/golang/go/issues/36494
+		//  - freebsd's backend is generally broken and asyncpreempt makes it even more so, see:
+		//    https://github.com/go-delve/delve/issues/1754
+		//  - on linux/arm64 asyncpreempt can sometimes restart a sequence of
+		//    instructions, if the sequence happens to contain a breakpoint it will
+		//    look like the breakpoint was hit twice when it was "logically" only
+		//    executed once.
+		//    See: https://go-review.googlesource.com/c/go/+/208126
+		DisableAsyncPreempt: runtime.GOOS == "windows" || runtime.GOOS == "freebsd" || (runtime.GOOS == "linux" && runtime.GOARCH == "arm64"),
+
+		StopReason: stopReason,
+		CanDump:    runtime.GOOS == "linux"})
+	if err != nil {
+		return nil, err
+	}
+	if dbp.bi.Arch.Name == "arm64" {
+		dbp.iscgo = tgt.IsCgo()
+	}
+	return tgt, nil
 }
 
 func (dbp *nativeProcess) handlePtraceFuncs() {
@@ -314,10 +317,11 @@ func (dbp *nativeProcess) postExit() {
 	if dbp.ctty != nil {
 		dbp.ctty.Close()
 	}
+	dbp.os.Close()
 }
 
 func (dbp *nativeProcess) writeSoftwareBreakpoint(thread *nativeThread, addr uint64) error {
-	_, err := thread.WriteMemory(uintptr(addr), dbp.bi.Arch.BreakpointInstruction())
+	_, err := thread.WriteMemory(addr, dbp.bi.Arch.BreakpointInstruction())
 	return err
 }
 

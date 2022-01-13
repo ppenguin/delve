@@ -64,7 +64,7 @@ func FindFixturesDir() string {
 type BuildFlags uint32
 
 const (
-	// LinkStrip enables '-ldflas="-s"'.
+	// LinkStrip enables '-ldflags="-s"'.
 	LinkStrip BuildFlags = 1 << iota
 	// EnableCGOOptimization will build CGO code with optimizations.
 	EnableCGOOptimization
@@ -76,6 +76,7 @@ const (
 	EnableDWZCompression
 	BuildModePIE
 	BuildModePlugin
+	BuildModeExternalLinker
 	AllNonOptimized
 )
 
@@ -140,6 +141,9 @@ func BuildFixture(name string, flags BuildFlags) Fixture {
 	}
 	if flags&BuildModePlugin != 0 {
 		buildFlags = append(buildFlags, "-buildmode=plugin")
+	}
+	if flags&BuildModeExternalLinker != 0 {
+		buildFlags = append(buildFlags, "-ldflags=-linkmode=external")
 	}
 	if ver.IsDevel() || ver.AfterOrEqual(goversion.GoVersion{Major: 1, Minor: 11, Rev: -1}) {
 		if flags&EnableDWZCompression != 0 {
@@ -310,7 +314,7 @@ func MustSupportFunctionCalls(t *testing.T, testBackend string) {
 		t.Skip("this version of Go does not support function calls")
 	}
 
-	if testBackend == "rr" || (runtime.GOOS == "darwin" && testBackend == "native") {
+	if runtime.GOOS == "darwin" && testBackend == "native" {
 		t.Skip("this backend does not support function calls")
 	}
 
@@ -363,11 +367,27 @@ var hasCgo = func() bool {
 	if err != nil {
 		panic(err)
 	}
-	return strings.TrimSpace(string(out)) == "1"
+	if strings.TrimSpace(string(out)) != "1" {
+		return false
+	}
+	_, err = exec.LookPath("gcc")
+	return err == nil
 }()
 
 func MustHaveCgo(t *testing.T) {
 	if !hasCgo {
 		t.Skip("Cgo not enabled")
+	}
+}
+
+func RegabiSupported() bool {
+	// Tracks regabiSupported variable in ParseGOEXPERIMENT internal/buildcfg/exp.go
+	switch {
+	case goversion.VersionAfterOrEqual(runtime.Version(), 1, 18):
+		return runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64" || runtime.GOARCH == "ppc64le" || runtime.GOARCH == "ppc64"
+	case goversion.VersionAfterOrEqual(runtime.Version(), 1, 17):
+		return runtime.GOARCH == "amd64" && (runtime.GOOS == "android" || runtime.GOOS == "linux" || runtime.GOOS == "darwin" || runtime.GOOS == "windows")
+	default:
+		return false
 	}
 }

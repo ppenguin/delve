@@ -1,19 +1,23 @@
 package terminal
 
+//lint:file-ignore ST1005 errors here can be capitalized
+
 import (
 	"fmt"
 	"io"
 	"net/rpc"
 	"os"
 	"os/signal"
-	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 
+	"github.com/derekparker/trie"
 	"github.com/peterh/liner"
 
 	"github.com/go-delve/delve/pkg/config"
+	"github.com/go-delve/delve/pkg/locspec"
+	"github.com/go-delve/delve/pkg/terminal/colorize"
 	"github.com/go-delve/delve/pkg/terminal/starbind"
 	"github.com/go-delve/delve/service"
 	"github.com/go-delve/delve/service/api"
@@ -46,26 +50,36 @@ const (
 
 // Term represents the terminal running dlv.
 type Term struct {
-	client   service.Client
-	conf     *config.Config
-	prompt   string
-	line     *liner.State
-	cmds     *Commands
-	dumb     bool
-	stdout   io.Writer
-	InitFile string
-	displays []string
+	client       service.Client
+	conf         *config.Config
+	prompt       string
+	line         *liner.State
+	cmds         *Commands
+	stdout       io.Writer
+	InitFile     string
+	displays     []displayEntry
+	colorEscapes map[colorize.Style]string
 
 	historyFile *os.File
 
 	starlarkEnv *starbind.Env
 
+	substitutePathRulesCache [][2]string
+
 	// quitContinue is set to true by exitCommand to signal that the process
 	// should be resumed before quitting.
 	quitContinue bool
 
+	longCommandMu         sync.Mutex
+	longCommandCancelFlag bool
+
 	quittingMutex sync.Mutex
 	quitting      bool
+}
+
+type displayEntry struct {
+	expr   string
+	fmtstr string
 }
 
 // New returns a new Term.
@@ -79,30 +93,41 @@ func New(client service.Client, conf *config.Config) *Term {
 		conf = &config.Config{}
 	}
 
-	var w io.Writer
-
-	dumb := strings.ToLower(os.Getenv("TERM")) == "dumb"
-	if dumb {
-		w = os.Stdout
-	} else {
-		w = getColorableWriter()
-	}
-
-	if (conf.SourceListLineColor > ansiWhite &&
-		conf.SourceListLineColor < ansiBrBlack) ||
-		conf.SourceListLineColor < ansiBlack ||
-		conf.SourceListLineColor > ansiBrWhite {
-		conf.SourceListLineColor = ansiBlue
-	}
-
 	t := &Term{
 		client: client,
 		conf:   conf,
 		prompt: "(dlv) ",
 		line:   liner.NewLiner(),
 		cmds:   cmds,
-		dumb:   dumb,
-		stdout: w,
+		stdout: os.Stdout,
+	}
+
+	if strings.ToLower(os.Getenv("TERM")) != "dumb" {
+		t.stdout = getColorableWriter()
+		t.colorEscapes = make(map[colorize.Style]string)
+		t.colorEscapes[colorize.NormalStyle] = terminalResetEscapeCode
+		wd := func(s string, defaultCode int) string {
+			if s == "" {
+				return fmt.Sprintf(terminalHighlightEscapeCode, defaultCode)
+			}
+			return s
+		}
+		t.colorEscapes[colorize.KeywordStyle] = conf.SourceListKeywordColor
+		t.colorEscapes[colorize.StringStyle] = wd(conf.SourceListStringColor, ansiGreen)
+		t.colorEscapes[colorize.NumberStyle] = conf.SourceListNumberColor
+		t.colorEscapes[colorize.CommentStyle] = wd(conf.SourceListCommentColor, ansiBrMagenta)
+		t.colorEscapes[colorize.ArrowStyle] = wd(conf.SourceListArrowColor, ansiYellow)
+		switch x := conf.SourceListLineColor.(type) {
+		case string:
+			t.colorEscapes[colorize.LineNoStyle] = x
+		case int:
+			if (x > ansiWhite && x < ansiBrBlack) || x < ansiBlack || x > ansiBrWhite {
+				x = ansiBlue
+			}
+			t.colorEscapes[colorize.LineNoStyle] = fmt.Sprintf(terminalHighlightEscapeCode, x)
+		case nil:
+			t.colorEscapes[colorize.LineNoStyle] = fmt.Sprintf(terminalHighlightEscapeCode, ansiBlue)
+		}
 	}
 
 	if client != nil {
@@ -121,11 +146,20 @@ func (t *Term) Close() {
 
 func (t *Term) sigintGuard(ch <-chan os.Signal, multiClient bool) {
 	for range ch {
+		t.longCommandCancel()
 		t.starlarkEnv.Cancel()
 		state, err := t.client.GetStateNonBlocking()
 		if err == nil && state.Recording {
 			fmt.Printf("received SIGINT, stopping recording (will not forward signal)\n")
 			err := t.client.StopRecording()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%v\n", err)
+			}
+			continue
+		}
+		if err == nil && state.CoreDumping {
+			fmt.Printf("received SIGINT, stopping dump\n")
+			err := t.client.CoreDumpCancel()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
 			}
@@ -179,21 +213,32 @@ func (t *Term) Run() (int, error) {
 	signal.Notify(ch, syscall.SIGINT)
 	go t.sigintGuard(ch, multiClient)
 
-	t.line.SetCompleter(func(line string) (c []string) {
-		if strings.HasPrefix(line, "break ") || strings.HasPrefix(line, "b ") {
-			filter := line[strings.Index(line, " ")+1:]
-			funcs, _ := t.client.ListFunctions(filter)
-			for _, f := range funcs {
-				c = append(c, "break "+f)
-			}
-			return
+	fns := trie.New()
+	cmds := trie.New()
+	funcs, _ := t.client.ListFunctions("")
+	for _, fn := range funcs {
+		fns.Add(fn, nil)
+	}
+	for _, cmd := range t.cmds.cmds {
+		for _, alias := range cmd.aliases {
+			cmds.Add(alias, nil)
 		}
-		for _, cmd := range t.cmds.cmds {
-			for _, alias := range cmd.aliases {
-				if strings.HasPrefix(alias, strings.ToLower(line)) {
-					c = append(c, alias)
+	}
+
+	t.line.SetCompleter(func(line string) (c []string) {
+		cmd := t.cmds.Find(strings.Split(line, " ")[0], noPrefix)
+		switch cmd.aliases[0] {
+		case "break", "trace", "continue":
+			if spc := strings.LastIndex(line, " "); spc > 0 {
+				prefix := line[:spc] + " "
+				funcs := fns.FuzzySearch(line[spc+1:])
+				for _, f := range funcs {
+					c = append(c, prefix+f)
 				}
 			}
+		case "nullcmd", "nocmd":
+			commands := cmds.FuzzySearch(strings.ToLower(line))
+			c = append(c, commands...)
 		}
 		return
 	})
@@ -267,15 +312,6 @@ func (t *Term) Run() (int, error) {
 	}
 }
 
-// Println prints a line to the terminal.
-func (t *Term) Println(prefix, str string) {
-	if !t.dumb {
-		terminalColorEscapeCode := fmt.Sprintf(terminalHighlightEscapeCode, t.conf.SourceListLineColor)
-		prefix = fmt.Sprintf("%s%s%s", terminalColorEscapeCode, prefix, terminalResetEscapeCode)
-	}
-	fmt.Fprintf(t.stdout, "%s%s\n", prefix, str)
-}
-
 // Substitutes directory to source file.
 //
 // Ensures that only directory is substituted, for example:
@@ -287,40 +323,33 @@ func (t *Term) Println(prefix, str string) {
 // in the order they are defined, first rule that matches is used for
 // substitution.
 func (t *Term) substitutePath(path string) string {
-	path = crossPlatformPath(path)
 	if t.conf == nil {
 		return path
 	}
-
-	// On windows paths returned from headless server are as c:/dir/dir
-	// though os.PathSeparator is '\\'
-
-	separator := "/"                     //make it default
-	if strings.Index(path, "\\") != -1 { //dependent on the path
-		separator = "\\"
-	}
-	for _, r := range t.conf.SubstitutePath {
-		from := crossPlatformPath(r.From)
-		to := r.To
-
-		if !strings.HasSuffix(from, separator) {
-			from = from + separator
-		}
-		if !strings.HasSuffix(to, separator) {
-			to = to + separator
-		}
-		if strings.HasPrefix(path, from) {
-			return strings.Replace(path, from, to, 1)
-		}
-	}
-	return path
+	return locspec.SubstitutePath(path, t.substitutePathRules())
 }
 
-func crossPlatformPath(path string) string {
-	if runtime.GOOS == "windows" {
-		return strings.ToLower(path)
+func (t *Term) substitutePathRules() [][2]string {
+	if t.substitutePathRulesCache != nil {
+		return t.substitutePathRulesCache
 	}
-	return path
+	if t.conf == nil || t.conf.SubstitutePath == nil {
+		return nil
+	}
+	spr := make([][2]string, 0, len(t.conf.SubstitutePath))
+	for _, r := range t.conf.SubstitutePath {
+		spr = append(spr, [2]string{r.From, r.To})
+	}
+	t.substitutePathRulesCache = spr
+	return spr
+}
+
+// formatPath applies path substitution rules and shortens the resulting
+// path by replacing the current directory with './'
+func (t *Term) formatPath(path string) string {
+	path = t.substitutePath(path)
+	workingDir, _ := os.Getwd()
+	return strings.Replace(path, workingDir, ".", 1)
 }
 
 func (t *Term) promptForInput() (string, error) {
@@ -446,9 +475,9 @@ func (t *Term) removeDisplay(n int) error {
 	if n < 0 || n >= len(t.displays) {
 		return fmt.Errorf("%d is out of range", n)
 	}
-	t.displays[n] = ""
+	t.displays[n] = displayEntry{"", ""}
 	for i := len(t.displays) - 1; i >= 0; i-- {
-		if t.displays[i] != "" {
+		if t.displays[i].expr != "" {
 			t.displays = t.displays[:i+1]
 			return nil
 		}
@@ -457,12 +486,12 @@ func (t *Term) removeDisplay(n int) error {
 	return nil
 }
 
-func (t *Term) addDisplay(expr string) {
-	t.displays = append(t.displays, expr)
+func (t *Term) addDisplay(expr, fmtstr string) {
+	t.displays = append(t.displays, displayEntry{expr: expr, fmtstr: fmtstr})
 }
 
 func (t *Term) printDisplay(i int) {
-	expr := t.displays[i]
+	expr, fmtstr := t.displays[i].expr, t.displays[i].fmtstr
 	val, err := t.client.EvalVariable(api.EvalScope{GoroutineID: -1}, expr, ShortLoadConfig)
 	if err != nil {
 		if isErrProcessExited(err) {
@@ -471,12 +500,12 @@ func (t *Term) printDisplay(i int) {
 		fmt.Printf("%d: %s = error %v\n", i, expr, err)
 		return
 	}
-	fmt.Printf("%d: %s = %s\n", i, val.Name, val.SinglelineString())
+	fmt.Printf("%d: %s = %s\n", i, val.Name, val.SinglelineStringFormatted(fmtstr))
 }
 
 func (t *Term) printDisplays() {
 	for i := range t.displays {
-		if t.displays[i] != "" {
+		if t.displays[i].expr != "" {
 			t.printDisplay(i)
 		}
 	}
@@ -484,6 +513,24 @@ func (t *Term) printDisplays() {
 
 func (t *Term) onStop() {
 	t.printDisplays()
+}
+
+func (t *Term) longCommandCancel() {
+	t.longCommandMu.Lock()
+	defer t.longCommandMu.Unlock()
+	t.longCommandCancelFlag = true
+}
+
+func (t *Term) longCommandStart() {
+	t.longCommandMu.Lock()
+	defer t.longCommandMu.Unlock()
+	t.longCommandCancelFlag = false
+}
+
+func (t *Term) longCommandCanceled() bool {
+	t.longCommandMu.Lock()
+	defer t.longCommandMu.Unlock()
+	return t.longCommandCancelFlag
 }
 
 // isErrProcessExited returns true if `err` is an RPC error equivalent of proc.ErrProcessExited
